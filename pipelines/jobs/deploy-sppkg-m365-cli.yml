@@ -1,0 +1,203 @@
+parameters:
+  - name: target_environment
+    type: string
+  - name: variable_group_name
+    type: string
+  - name: uat_site
+    type: string
+    default: ''  
+
+jobs:
+- deployment: deploy_sppkg
+  displayName: 'Upload & deploy *.sppkg to SharePoint app catalog'
+  pool:
+    vmImage: 'ubuntu-latest'
+  environment: ${{ parameters.target_environment }}
+  variables:
+  - group: ${{ parameters.variable_group_name }}
+  strategy:
+    runOnce:
+      deploy:
+        steps:
+        - download: current
+          artifact: drop
+          patterns: '**/*.sppkg'
+        - pwsh: sudo npm install -g @pnp/cli-microsoft365
+          displayName: Install CLI for Microsoft365
+        - task: DownloadSecureFile@1
+          inputs:
+            secureFile: PnP.SharePoint.AppOnly.pfx
+          displayName: 'Download authentication certificate'
+          name: AppCertificate
+        - pwsh: |
+            m365 login --authType certificate --certificateFile $(AppCertificate.secureFilePath) --password "$(aad_app_password)" --appId $(aad_app_id) --tenant $(aad_tenant_id)
+            $uri = [System.Uri]"$(site_url_prd)"
+            m365 spo set --url $($uri.Scheme + "://" + $uri.Authority)
+          displayName: Login to Microsoft 365 with the CLI and set tenant context
+        - pwsh: |
+            m365 cli config set --key output --value json
+            m365 cli config set --key errorOutput --value stdout
+          displayName: Configuring CLI for Microsoft 365 output error handling
+        - ${{ if ne(parameters.target_environment, 'PRD') }}:
+          - pwsh: Install-Module -Name "PnP.PowerShell" -Force
+            displayName: Installing PnP.PowerShell Module
+          - pwsh: |
+              $securePassword = ConvertTo-SecureString "$(aad_app_password)" -AsPlainText -Force
+              Connect-PnPOnline -Url $(site_url_prd) -ClientId $(aad_app_id) -Tenant $(aad_tenant_id) -CertificatePath "$(AppCertificate.secureFilePath)" -CertificatePassword $securePassword
+              Get-PnPSiteTemplate -Out $(Pipeline.Workspace)/template.pnp
+              Add-PnPDataRowsToSiteTemplate -Path $(Pipeline.Workspace)/template.pnp -List "$(site_list_prd)"
+            displayName: Connecting to Production site and get site template
+          - pwsh: |
+              function Get-CLIValue {
+                [cmdletbinding()]
+                param(
+                  [parameter(Mandatory = $true, ValueFromPipeline = $true)]
+                  $input
+                )
+                  $output = $input | ConvertFrom-Json
+                  if ($output.error -ne $null) {
+                    throw $output.error
+                  }
+                  return $output
+              }
+              
+              $siteName = "$(site_name_prd)-${{ parameters.target_environment }}" + [guid]::NewGuid().Guid
+              $siteUrl = "/sites/" + $siteName
+
+              try {
+                $site = m365 spo site add --type CommunicationSite --url $siteUrl --title $siteName --owners "$(site_copy_owner)" | Get-CLIValue
+                Write-Host "##vso[task.setvariable variable=siteCopy;isOutput=true]$site"
+                Write-Host $site
+              }
+              catch {
+                Write-Host $_.Exception.Message -ForegroundColor Yellow
+              }
+            name: CreateSiteCopy
+            displayName: Create ${{ parameters.target_environment }} site copy
+          - pwsh: |
+              $securePassword = ConvertTo-SecureString "$(aad_app_password)" -AsPlainText -Force
+              Connect-PnPOnline -Url $(CreateSiteCopy.siteCopy) -ClientId $(aad_app_id) -Tenant $(aad_tenant_id) -CertificatePath "$(AppCertificate.secureFilePath)" -CertificatePassword $securePassword
+              Invoke-PnPSiteTemplate -Path $(Pipeline.Workspace)/template.pnp -ClearNavigation
+            displayName: Apply PRD site template to ${{ parameters.target_environment }} site copy
+        - pwsh: |
+            $package = Get-ChildItem -Path $(Pipeline.Workspace)/drop -Recurse -Filter '*.sppkg' | Select Name | Select-Object -First 1
+            Write-Host "##vso[task.setvariable variable=SpPkgFileName;isOutput=true]$($package.Name)"
+          name: GetSharePointPackage
+          displayName: Get generated *.sppkg filename
+        - ${{ if ne(parameters.target_environment, 'PRD') }}:
+          - pwsh: |
+              function Get-CLIValue {
+                [cmdletbinding()]
+                param(
+                  [parameter(Mandatory = $true, ValueFromPipeline = $true)]
+                  $input
+                )
+                  $output = $input | ConvertFrom-Json
+                  if ($output.error -ne $null) {
+                    throw $output.error
+                  }
+                  return $output
+              }
+
+              $uploadHasFailed = $false
+
+              try {
+                m365 spo site appcatalog add --url $(CreateSiteCopy.siteCopy) | Get-CLIValue
+                $appId = m365 spo app add --filePath "$(Pipeline.Workspace)/drop/sharepoint/solution/$(GetSharePointPackage.SpPkgFileName)" --appCatalogUrl $(CreateSiteCopy.siteCopy) --scope sitecollection --debug | Get-CLIValue
+              }
+              catch {
+                Write-Host $_.Exception.Message -ForegroundColor Yellow
+                Write-Host "Retrying by removing and re-enabling the site collection app catalog, then the package (after 30 seconds delay)"
+                $uploadHasFailed = $true
+              }
+              finally {
+                if ($uploadHasFailed -eq $true) {
+                  m365 spo site appcatalog remove --url $(CreateSiteCopy.siteCopy)
+                  m365 spo site appcatalog add --url $(CreateSiteCopy.siteCopy)
+                  Start-Sleep -Seconds 30
+                  $appId = m365 spo app add --filePath "$(Pipeline.Workspace)/drop/sharepoint/solution/$(GetSharePointPackage.SpPkgFileName)" --appCatalogUrl $(CreateSiteCopy.siteCopy) --scope sitecollection --overwrite | Get-CLIValue
+                }
+
+                Write-Host "##vso[task.setvariable variable=packageId;isOutput=true]$uniqueId"
+              }
+            name: SPOPackage
+            displayName: Enable Site Collection App Catalog and upload SharePoint package
+          - pwsh: |
+              function Get-CLIValue {
+                [cmdletbinding()]
+                param(
+                  [parameter(Mandatory = $true, ValueFromPipeline = $true)]
+                  $input
+                )
+                  $output = $input | ConvertFrom-Json
+                  if ($output.error -ne $null) {
+                    throw $output.error
+                  }
+                  return $output
+              }
+              
+              $deployHasFailed = $false
+
+              try {
+                m365 spo app deploy --name $(GetSharePointPackage.SpPkgFileName) --appCatalogUrl $(CreateSiteCopy.siteCopy) --scope sitecollection | Get-CLIValue
+              }
+              catch {
+                Write-Host $_.Exception.Message -ForegroundColor Yellow
+                Write-Host "Retrying by adding once again the package and deploying it"
+                $deployHasFailed = $true
+              }
+              finally {
+                if ($deployHasFailed -eq $true) {
+                  m365 spo app add --filePath "$(Pipeline.Workspace)/drop/sharepoint/solution/$(GetSharePointPackage.SpPkgFileName)" --appCatalogUrl $(CreateSiteCopy.siteCopy) --scope sitecollection --overwrite
+                  m365 spo app deploy --name $(GetSharePointPackage.SpPkgFileName) --appCatalogUrl $(CreateSiteCopy.siteCopy) --scope sitecollection
+                }
+
+                m365 spo app install --id $(SPOPackage.packageId) --s $(CreateSiteCopy.siteCopy) --scope sitecollection
+              }
+            displayName: Deploy SharePoint package and add it to the site
+          - pwsh: |
+              function Get-CLIValue {
+                [cmdletbinding()]
+                param(
+                  [parameter(Mandatory = $true, ValueFromPipeline = $true)]
+                  $input
+                )
+                  $output = $input | ConvertFrom-Json
+                  if ($output.error -ne $null) {
+                    throw $output.error
+                  }
+                  return $output
+              }    
+
+              $webPartHasFailed = $false
+
+              if ('$(webpart_id)' -ne '') {
+                m365 spo page add -n "TestSPFx.aspx" -u $(CreateSiteCopy.siteCopy)
+
+                try {
+                  m365 spo page clientsidewebpart add -u $(CreateSiteCopy.siteCopy) --pageName "TestSPFx.aspx" --webPartId $(webpart_id) | Get-CLIValue
+                }
+                catch {
+                  Write-Host $_.Exception.Message -ForegroundColor Yellow
+                  Write-Host "Retrying the WebPart addition after 30 seconds delay"
+
+                  $webPartHasFailed = $true
+
+                  Start-Sleep -Seconds 30
+                }
+                finally {
+                  if ($webPartHasFailed -eq $true) {
+                    m365 spo page clientsidewebpart add -u $(CreateSiteCopy.siteCopy) --pageName "TestSPFx.aspx" --webPartId $(webpart_id) | Get-CLIValue
+                  }
+                }
+              }
+            displayName: Add an article page and the WebPart (if exists)
+        - ${{ if eq(parameters.target_environment, 'PRD') }}:
+          - pwsh: m365 spo app add --filePath "$(Pipeline.Workspace)/drop/sharepoint/solution/$(GetSharePointPackage.SpPkgFileName)" --appCatalogUrl $(tenant_app_catalog_site_url) --scope $(app_catalog_scope) --overwrite
+            displayName: Upload SharePoint package to $(app_catalog_scope) App Catalog
+          - pwsh: m365 spo app deploy --name $(GetSharePointPackage.SpPkgFileName) --appCatalogUrl $(tenant_app_catalog_site_url) --scope $(app_catalog_scope)
+            displayName: Deploy SharePoint package
+          - ${{ if ne(parameters.uat_site, '') }}:
+            - pwsh: |
+                m365 spo site remove -u ${{ parameters.uat_site }} --skipRecycleBin --confirm --wait
+              displayName: Remove site copy

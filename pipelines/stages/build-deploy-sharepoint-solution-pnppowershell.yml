@@ -1,0 +1,45 @@
+parameters:
+  - name: include_tests
+    type: boolean
+    default: true
+  - name: variable_group_uat
+    type: string
+  - name: variable_group_prd
+    type: string
+  - name: deploy_dev
+    type: boolean
+    default: true
+  - name: deploy_uat
+    type: boolean
+    default: true
+  - name: deploy_prd
+    type: boolean
+    default: true
+
+stages:
+  - stage: 'build'
+    jobs:
+      - template: ../jobs/build-spfx.yml
+        parameters:
+          include_tests: false
+  - ${{ if eq(parameters.deploy_uat, true) }}:
+    - stage: 'deploy_uat'
+      displayName: Deploy on UAT
+      dependsOn: [ build ]
+      jobs:
+        - template: ../jobs/deploy-sppkg-pnp-powershell.yml
+          parameters:
+            target_environment: 'UAT'
+            variable_group_name: ${{ parameters.variable_group_uat }}
+  - ${{ if eq(parameters.deploy_prd, true) }}:
+    - stage: 'deploy_prd'
+      displayName: Deploy on PRD
+      dependsOn: [ deploy_uat ]
+      variables:
+        siteToRemove: $[stageDependencies.deploy_uat.deploy_sppkg.outputs['deploy_sppkg.CreateSiteCopy.siteCopy']]
+      jobs:
+        - template: ../jobs/deploy-sppkg-pnp-powershell.yml
+          parameters:
+            target_environment: 'PRD'
+            variable_group_name: ${{ parameters.variable_group_prd }}
+            uat_site: $(siteToRemove)

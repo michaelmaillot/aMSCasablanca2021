@@ -1,0 +1,15 @@
+name: $(GITVERSION_FullSemVer)$(rev:-r)
+
+trigger:
+  branches:
+    include:
+      - main
+
+stages:
+  - template: pipelines/stages/build-deploy-sharepoint-solution-pnppowershell.yml
+    parameters:
+      include_tests: false
+      variable_group_uat: 'aMSCasablanca-UAT'
+      variable_group_prd: 'aMSCasablanca-PRD'
+      deploy_uat: true
+      deploy_prd: true

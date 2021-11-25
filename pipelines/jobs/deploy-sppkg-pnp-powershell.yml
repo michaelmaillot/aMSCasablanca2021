@@ -1,0 +1,124 @@
+parameters:
+  - name: target_environment
+    type: string
+  - name: variable_group_name
+    type: string
+  - name: uat_site
+    type: string
+    default: ''  
+
+jobs:
+- deployment: deploy_sppkg
+  displayName: 'Upload & deploy *.sppkg to SharePoint app catalog'
+  pool:
+    vmImage: 'ubuntu-latest'
+  environment: ${{ parameters.target_environment }}
+  variables:
+  - group: ${{ parameters.variable_group_name }}
+  strategy:
+    runOnce:
+      deploy:
+        steps:
+        - download: current
+          artifact: drop
+          patterns: '**/*.sppkg'
+        - pwsh: Install-Module -Name "PnP.PowerShell" -Force
+          displayName: Installing PnP.PowerShell Module
+        - task: DownloadSecureFile@1
+          inputs:
+            secureFile: PnP.SharePoint.AppOnly.pfx
+          displayName: 'Download authentication certificate'
+          name: AppCertificate
+        - ${{ if ne(parameters.target_environment, 'PRD') }}:
+          - pwsh: |
+              $securePassword = ConvertTo-SecureString "$(aad_app_password)" -AsPlainText -Force
+              Connect-PnPOnline -Url $(site_url_prd) -ClientId $(aad_app_id) -Tenant $(aad_tenant_id) -CertificatePath "$(AppCertificate.secureFilePath)" -CertificatePassword $securePassword
+              Get-PnPSiteTemplate -Out $(Pipeline.Workspace)/template.pnp
+              Add-PnPDataRowsToSiteTemplate -Path $(Pipeline.Workspace)/template.pnp -List "$(site_list_prd)"
+            displayName: Connecting to Production site and get site template (with list data)
+          - pwsh: |
+              $siteName = "$(site_name_prd)-${{ parameters.target_environment }}" + [guid]::NewGuid().Guid
+              $uri = [System.Uri]"$(site_url_prd)"
+              $siteUrl = $uri.Scheme + "://" + $uri.Authority + "/sites/" + $siteName
+
+              $securePassword = ConvertTo-SecureString "$(aad_app_password)" -AsPlainText -Force
+              Connect-PnPOnline -Url $(site_url_prd) -ClientId $(aad_app_id) -Tenant $(aad_tenant_id) -CertificatePath "$(AppCertificate.secureFilePath)" -CertificatePassword $securePassword
+              $site = New-PnPSite -Type CommunicationSite -Title $siteName -Url $siteUrl -Owner "$(site_copy_owner)" -Wait
+              Write-Host "##vso[task.setvariable variable=siteCopy;isOutput=true]$site"
+              Write-Host $site
+            name: CreateSiteCopy
+            displayName: Create ${{ parameters.target_environment }} site copy
+          - pwsh: |
+              $securePassword = ConvertTo-SecureString "$(aad_app_password)" -AsPlainText -Force
+              Connect-PnPOnline -Url $(CreateSiteCopy.siteCopy) -ClientId $(aad_app_id) -Tenant $(aad_tenant_id) -CertificatePath "$(AppCertificate.secureFilePath)" -CertificatePassword $securePassword
+              Invoke-PnPSiteTemplate -Path $(Pipeline.Workspace)/template.pnp -ClearNavigation
+            displayName: Apply PRD site template to ${{ parameters.target_environment }} site copy
+        - pwsh: |
+            $package = Get-ChildItem -Path $(Pipeline.Workspace)/drop -Recurse -Filter '*.sppkg' | Select Name | Select-Object -First 1
+            Write-Host "##vso[task.setvariable variable=SpPkgFileName;isOutput=true]$($package.Name)"
+          name: GetSharePointPackage
+          displayName: Get generated *.sppkg filename
+        - ${{ if ne(parameters.target_environment, 'PRD') }}:
+          - pwsh: |
+              $uploadHasFailed = $false
+
+              try {
+                $securePassword = ConvertTo-SecureString "$(aad_app_password)" -AsPlainText -Force
+                Connect-PnPOnline -Url $(CreateSiteCopy.siteCopy) -ClientId $(aad_app_id) -Tenant $(aad_tenant_id) -CertificatePath "$(AppCertificate.secureFilePath)" -CertificatePassword $securePassword
+                Add-PnPSiteCollectionAppCatalog
+                $packageId = Add-PnPApp -Path "$(Pipeline.Workspace)/drop/sharepoint/solution/$(GetSharePointPackage.SpPkgFileName)" -Scope Site -Publish
+              }
+              catch {
+                Write-Host $_.Exception.Message -ForegroundColor Yellow
+                Write-Host "Retrying by removing and re-enabling the site collection app catalog, then the package (after 30 seconds delay)"
+                $uploadHasFailed = $true
+              }
+              finally {
+                if ($uploadHasFailed -eq $true) {
+                  Remove-PnPSiteCollectionAppCatalog -Site $(CreateSiteCopy.siteCopy)
+                  Add-PnPSiteCollectionAppCatalog
+                  Start-Sleep -Seconds 30
+                  $packageId = Add-PnPApp -Path "$(Pipeline.Workspace)/drop/sharepoint/solution/$(GetSharePointPackage.SpPkgFileName)" -Scope Site -Publish -Overwrite
+                }
+              }
+
+              Install-PnPApp -Identity $packageId.Id -Scope Site
+            displayName: Enable Site Collection App Catalog, upload SharePoint package, deploy it and add it to the site
+          - pwsh: |
+              $webPartHasFailed = $false
+
+              if ('$(webpart_name)' -ne '') {
+                try {
+                  $securePassword = ConvertTo-SecureString "$(aad_app_password)" -AsPlainText -Force
+                  Connect-PnPOnline -Url $(CreateSiteCopy.siteCopy) -ClientId $(aad_app_id) -Tenant $(aad_tenant_id) -CertificatePath "$(AppCertificate.secureFilePath)" -CertificatePassword $securePassword
+                  Add-PnPPage -Name "TestSPFx"
+                  Add-PnPPageWebPart -Page "TestSPFx" -Component "$(webpart_name)"
+                }
+                catch {
+                  Write-Host $_.Exception.Message -ForegroundColor Yellow
+                  Write-Host "Retrying the WebPart addition after 30 seconds delay"
+
+                  $webPartHasFailed = $true
+
+                  Start-Sleep -Seconds 30
+                }
+                finally {
+                  if ($webPartHasFailed -eq $true) {
+                    Add-PnPPageWebPart -Page "TestSPFx" -Component "$(webpart_name)"
+                  }
+                }
+              }
+            displayName: Add an article page and the WebPart (if exists)
+        - ${{ if eq(parameters.target_environment, 'PRD') }}:
+          - pwsh: |
+              $securePassword = ConvertTo-SecureString "$(aad_app_password)" -AsPlainText -Force
+              Connect-PnPOnline -Url $(site_url_prd) -ClientId $(aad_app_id) -Tenant $(aad_tenant_id) -CertificatePath "$(AppCertificate.secureFilePath)" -CertificatePassword $securePassword
+              Add-PnPApp -Path "$(Pipeline.Workspace)/drop/sharepoint/solution/$(GetSharePointPackage.SpPkgFileName)" -Scope $(app_catalog_scope) -Publish -Overwrite
+            displayName: Upload SharePoint package to $(app_catalog_scope) App Catalog
+          - ${{ if ne(parameters.uat_site, '') }}:
+            - pwsh: |
+                $securePassword = ConvertTo-SecureString "$(aad_app_password)" -AsPlainText -Force
+                Connect-PnPOnline -Url $(site_url_prd) -ClientId $(aad_app_id) -Tenant $(aad_tenant_id) -CertificatePath "$(AppCertificate.secureFilePath)" -CertificatePassword $securePassword
+                
+                Remove-PnPTenantSite -Url ${{ parameters.uat_site }} -SkipRecyclebin -Force
+              displayName: Remove site copy
